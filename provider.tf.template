@@ -1,0 +1,36 @@
+#####################################
+# Setup AWS as our Terraform provider
+#####################################
+provider "aws" {
+  access_key = %TF_ACCESS_KEY_ID%
+  secret_key = %TF_SECRET_KEY_ID%
+  region    = "%TF_AWS_REGION%"
+  profile   = "%TF_AWS_PROFILE%"
+}
+
+provider "null" {
+  version = "2.1.2"
+}
+
+provider "archive" {
+  version = "1.3.0"
+}
+
+##############################################################################
+# Setup S3 as the backend for Terraform's state. All the operations that TF
+# has done and their result are stored in this state file. Having a shared one
+# on S3 allows multiple users to use the same Terraform code on the same infra
+# and not step on each other's toes.
+##############################################################################
+terraform {
+  required_version = "0.12.24"
+
+  backend "s3" {
+    profile               = "%TF_AWS_PROFILE%"        # 
+    bucket                = "%TF_AWS_S3_BUCKET%"      # 
+    key                   = shared/terraform.tfstate         # "%TF_AWS_STATE_FILE_KEY%" # [key]/terraform.tfstate
+    region                = "%TF_AWS_REGION%"         # 
+    encrypt               = "true"
+    dynamodb_table        = "terraform-state-lock" 
+  }
+}

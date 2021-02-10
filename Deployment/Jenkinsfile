@@ -1,0 +1,415 @@
+#!/usr/bin/env groovy
+
+def lastStage
+def version
+def gitCommitShort
+
+// Shared Configuration
+def awsRegion                   = ''
+def terraformWorkspaceKeyPrefix = ''
+def ecsClusterPrefix            = ''
+def nginxServiceName            = 'nginx'
+
+// PROD AWS Account Configuration
+def prodAWSAccountId                    = '581246044019'
+def prodAWSCredentialsId                = 'aws-infra'
+def prodAWSCredentialsProfileName       = ''
+def prodTerraformBackendS3BucketName    = ''
+def prodECRRepositoryUrl                = "${prodAWSAccountId}.dkr.ecr.${awsRegion}.amazonaws.com/"
+// NON-PROD AWS Account Configuration
+def nonProdAWSAccountId                 = '412933375937'
+def nonProdAWSCredentialsId             = 'aws-infra-non-prod'
+def nonProdAWSCredentialsProfileName    = ''
+def nonProdTerraformBackendS3BucketName = ''
+def nonProdECRRepositoryUrl             = "${nonProdAWSAccountId}.dkr.ecr.${awsRegion}.amazonaws.com/"
+
+pipeline {
+  agent { label 'docker-node-terraform' }
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '10'))
+    timeout(time: 1, unit: 'HOURS')
+    disableConcurrentBuilds()
+  }
+  stages {
+    stage('tf validate') {
+      steps {
+        script {
+          lastStage = "${env.STAGE_NAME}"
+          version = sh (script: '''git show HEAD:package.json | grep \'"version":\' | sed \'s/.*"version": "/\'\'/\' | sed \'s/",/\'\'/\'''', returnStdout: true).trim()
+          gitCommitShort = sh (script: '''git rev-parse --short HEAD''', returnStdout: true ).trim()
+        }
+        // sendNotification('STARTED', lastStage)
+        withCredentials([file(credentialsId: 'secret_encryption_key.pem', variable: 'private_key')]) {
+          sh 'cp ${private_key} terraform/deploy/secrets/key.pem'
+        }
+        withAwsCli(credentialsId: nonProdAWSCredentialsId, defaultRegion: awsRegion) {
+          sh script: "export TF_IN_AUTOMATION=true", label: "Setting terraform to run in AUTOMATION mode."
+          // sh script: "./configure_provider.sh us-east-1", label: "Configure AWS provider for terraform"
+          dir('terraform') {
+            sh script: "echo '1' | TF_IN_AUTOMATION=true terraform init -reconfigure", label: "Initialize a working directory containing terraform configuration files, disregard any existing configuration"
+            // Validate SIT
+            sh script: "terraform workspace select sit || terraform workspace new sit", label: "Select sit workspace"
+            sh script: "terraform validate", label: "Validate the configuration files"
+            // Validate UAT
+            sh script: "terraform workspace select uat || terraform workspace new uat", label: "Select uat workspace"
+            sh script: "terraform validate", label: "Validate the configuration files"
+            // Validate PT
+            // sh script: "terraform workspace select pt || terraform workspace new pt", label: "Select pt workspace"
+            // sh script: "terraform validate", label: "Validate the configuration files"
+            // Validate STAGING
+            sh script: "terraform workspace select staging || terraform workspace new staging", label: "Select staging workspace"
+            sh script: "terraform validate", label: "Validate the configuration files"
+          }
+        }
+        withAwsCli(credentialsId: prodAWSCredentialsId, defaultRegion: awsRegion) {
+          // sh script: "./configure_provider.sh ", label: "Configure AWS provider for terraform"
+          dir('terraform') {
+            sh script: "echo '1' | TF_IN_AUTOMATION=true terraform init -reconfigure", label: "Initialize a working directory containing terraform configuration files, disregard any existing configuration"
+            // Validate PREVIEW
+            sh script: "terraform workspace select preview || terraform workspace new preview", label: "Select preview workspace"
+            sh script: "terraform validate", label: "Validate the configuration files"
+            // Validate PROD
+            sh script: "terraform workspace select prod || terraform workspace new prod", label: "Select prod workspace"
+            sh script: "terraform validate", label: "Validate the configuration files"
+          }
+        }
+      }
+    }
+    stage('[SIT] tf plan') {
+      steps {
+        script { lastStage = "${env.STAGE_NAME}" }
+        terraformPlan("sit", nonProdAWSCredentialsId, awsRegion, nonProdAWSCredentialsProfileName, nonProdTerraformBackendS3BucketName, terraformWorkspaceKeyPrefix)
+      }
+    }
+    stage('[UAT] tf plan') {
+      steps {
+        script { lastStage = "${env.STAGE_NAME}" }
+        terraformPlan("uat", nonProdAWSCredentialsId, awsRegion, nonProdAWSCredentialsProfileName, nonProdTerraformBackendS3BucketName, terraformWorkspaceKeyPrefix)
+      }
+    }
+    stage('[STAGING] tf plan') {
+      steps {
+        script { lastStage = "${env.STAGE_NAME}" }
+        terraformPlan("staging", nonProdAWSCredentialsId, awsRegion, nonProdAWSCredentialsProfileName, nonProdTerraformBackendS3BucketName, terraformWorkspaceKeyPrefix)
+      }
+    }
+    stage('[PREVIEW] tf plan') {
+      steps {
+        script { lastStage = "${env.STAGE_NAME}" }
+        terraformPlan("preview", prodAWSCredentialsId, awsRegion, prodAWSCredentialsProfileName, prodTerraformBackendS3BucketName, terraformWorkspaceKeyPrefix)
+      }
+    }
+    stage('[PROD] tf plan') {
+      steps {
+        script { lastStage = "${env.STAGE_NAME}" }
+        terraformPlan("prod", prodAWSCredentialsId, awsRegion, prodAWSCredentialsProfileName, prodTerraformBackendS3BucketName, terraformWorkspaceKeyPrefix)
+      }
+    }
+    stage('[SIT] build and push nginx') {
+      when { branch 'master' }
+      parallel {
+        stage('Nginx') {
+          steps {
+            script {
+              ENVIRONMENT        = "sit"
+              DOCKER_IMAGE_NGINX = "${nonProdAWSAccountId}.dkr.ecr.${awsRegion}.amazonaws.com/:nginx_${ENVIRONMENT}"
+            }
+            withAwsCli(credentialsId: nonProdAWSCredentialsId, defaultRegion: awsRegion) {
+              sh script: "eval \$(aws ecr get-login --no-include-email --region ${awsRegion})", label: "Login to ECR"
+              dir('docker/nginx') {
+                sh script: "docker build -t ${DOCKER_IMAGE_NGINX} .", label: "Build nginx image"
+              }
+              sh script: "docker push ${DOCKER_IMAGE_NGINX}", label: "Push nginx image to ECR"
+              sh script: "docker rmi ${DOCKER_IMAGE_NGINX}", label: "Delete local nginx image"
+            }
+          }
+        }
+      }
+    }
+    stage('[SIT] tf apply') {
+      when { branch 'master' }
+      steps {
+        script { lastStage   = "${env.STAGE_NAME}" }
+        terraformApply("sit", nonProdAWSCredentialsId, awsRegion, nonProdAWSCredentialsProfileName, nonProdTerraformBackendS3BucketName, terraformWorkspaceKeyPrefix)
+      }
+    }
+    stage('[SIT] Redeploy nginx') {
+      when {
+        allOf {
+          branch 'master'
+          expression {
+            CHANGES = sh(returnStdout: true, script: 'git diff --name-only HEAD HEAD~1 | grep docker/nginx || true').trim()
+            return "${CHANGES}" != ""
+          }
+        }
+      }
+      steps {
+        redeployService("sit", nonProdAWSCredentialsId, awsRegion, ecsClusterPrefix, nginxServiceName)
+      }
+    }
+    stage('[UAT] approval') {
+      when { branch 'master' }
+      steps {
+        script {
+          lastStage = "${env.STAGE_NAME}"
+          timeout(time: 30, unit: 'MINUTES') {
+            def userInput = input(id: 'confirm', message: 'Apply Terraform?', parameters: [ [$class: 'BooleanParameterDefinition', defaultValue: false, description: 'Apply terraform', name: 'confirm'] ])
+          }
+        }
+      }
+    }
+    stage('[UAT] pull, tag and push nginx') {
+      when { branch 'master' }
+      parallel {
+        stage('Nginx') {
+          steps {
+            pullTagPushDockerImageECR(nonProdECRRepositoryUrl, nonProdECRRepositoryUrl, "nginx_sit", "nginx_uat", nonProdAWSCredentialsId, nonProdAWSCredentialsId, awsRegion, awsRegion)
+          }
+        }
+      }
+    }
+    stage('[UAT] tf apply') {
+      when { branch 'master' }
+      steps {
+        script { lastStage   = "${env.STAGE_NAME}" }
+        terraformApply("uat", nonProdAWSCredentialsId, awsRegion, nonProdAWSCredentialsProfileName, nonProdTerraformBackendS3BucketName, terraformWorkspaceKeyPrefix)
+      }
+    }
+    stage('[UAT] Redeploy nginx') {
+      when {
+        allOf {
+          branch 'master'
+          expression {
+            CHANGES = sh(returnStdout: true, script: 'git diff --name-only HEAD HEAD~1 | grep docker/nginx || true').trim()
+            return "${CHANGES}" != ""
+          }
+        }
+      }
+      steps {
+        redeployService("uat", nonProdAWSCredentialsId, awsRegion, ecsClusterPrefix, nginxServiceName)
+      }
+    }
+    stage('[STAGING] approval') {
+      when { branch 'master' }
+      steps {
+        script {
+          lastStage = "${env.STAGE_NAME}"
+          timeout(time: 30, unit: 'MINUTES') {
+            def userInput = input(id: 'confirm', message: 'Apply Terraform?', parameters: [ [$class: 'BooleanParameterDefinition', defaultValue: false, description: 'Apply terraform', name: 'confirm'] ])
+          }
+        }
+      }
+    }
+    stage('[STAGING] pull, tag and push nginx') {
+      when { branch 'master' }
+      parallel {
+        stage('Nginx') {
+          steps {
+            pullTagPushDockerImageECR(nonProdECRRepositoryUrl, nonProdECRRepositoryUrl, "nginx_uat", "nginx_staging", nonProdAWSCredentialsId, nonProdAWSCredentialsId, awsRegion, awsRegion)
+          }
+        }
+      }
+    }
+    stage('[STAGING] tf apply') {
+      when { branch 'master' }
+      steps {
+        script { lastStage   = "${env.STAGE_NAME}" }
+        terraformApply("staging", nonProdAWSCredentialsId, awsRegion, nonProdAWSCredentialsProfileName, nonProdTerraformBackendS3BucketName, terraformWorkspaceKeyPrefix)
+      }
+    }
+    stage('[STAGING] Redeploy nginx') {
+      when {
+        allOf {
+          branch 'master'
+          expression {
+            CHANGES = sh(returnStdout: true, script: 'git diff --name-only HEAD HEAD~1 | grep docker/nginx || true').trim()
+            return "${CHANGES}" != ""
+          }
+        }
+      }
+      steps {
+        redeployService("staging", nonProdAWSCredentialsId, awsRegion, ecsClusterPrefix, nginxServiceName)
+      }
+    }
+    stage('[PREVIEW] approval') {
+      when { branch 'master' }
+      steps {
+        script {
+          lastStage = "${env.STAGE_NAME}"
+          timeout(time: 30, unit: 'MINUTES') {
+            def userInput = input(id: 'confirm', message: 'Apply Terraform?', parameters: [ [$class: 'BooleanParameterDefinition', defaultValue: false, description: 'Apply terraform', name: 'confirm'] ])
+          }
+        }
+      }
+    }
+    stage('[PREVIEW] pull, tag and push nginx') {
+      when { branch 'master' }
+      parallel {
+        stage('Nginx') {
+          steps {
+            pullTagPushDockerImageECR(nonProdECRRepositoryUrl, prodECRRepositoryUrl, "nginx_staging", "nginx_preview", nonProdAWSCredentialsId, prodAWSCredentialsId, awsRegion, awsRegion)
+          }
+        }
+      }
+    }
+    stage('[PREVIEW] tf apply') {
+      when { branch 'master' }
+      steps {
+        script { lastStage   = "${env.STAGE_NAME}" }
+        terraformApply("preview", prodAWSCredentialsId, awsRegion, prodAWSCredentialsProfileName, prodTerraformBackendS3BucketName, terraformWorkspaceKeyPrefix)
+      }
+    }
+    stage('[PREVIEW] Redeploy nginx') {
+      when {
+        allOf {
+          branch 'master'
+          expression {
+            CHANGES = sh(returnStdout: true, script: 'git diff --name-only HEAD HEAD~1 | grep docker/nginx || true').trim()
+            return "${CHANGES}" != ""
+          }
+        }
+      }
+      steps {
+        redeployService("preview", prodAWSCredentialsId, awsRegion, ecsClusterPrefix, nginxServiceName)
+      }
+    }
+    stage('[PROD] approval') {
+      when { branch 'master' }
+      steps {
+        script {
+          lastStage = "${env.STAGE_NAME}"
+          timeout(time: 30, unit: 'MINUTES') {
+            def userInput = input(id: 'confirm', message: 'Apply Terraform?', parameters: [ [$class: 'BooleanParameterDefinition', defaultValue: false, description: 'Apply terraform', name: 'confirm'] ])
+          }
+        }
+      }
+    }
+    stage('[PROD] pull, tag and push nginx') {
+      when { branch 'master' }
+      parallel {
+        stage('Nginx') {
+          steps {
+            pullTagPushDockerImageECR(prodECRRepositoryUrl, prodECRRepositoryUrl, "nginx_preview", "nginx_prod", prodAWSCredentialsId, prodAWSCredentialsId, awsRegion, awsRegion)
+          }
+        }
+      }
+    }
+    stage('[PROD] tf apply') {
+      when { branch 'master' }
+      steps {
+        script { lastStage   = "${env.STAGE_NAME}" }
+        terraformApply("prod", prodAWSCredentialsId, awsRegion, prodAWSCredentialsProfileName, prodTerraformBackendS3BucketName, terraformWorkspaceKeyPrefix)
+      }
+    }
+    stage('[PROD] Redeploy nginx') {
+      when {
+        allOf {
+          branch 'master'
+          expression {
+            CHANGES = sh(returnStdout: true, script: 'git diff --name-only HEAD HEAD~1 | grep docker/nginx || true').trim()
+            return "${CHANGES}" != ""
+          }
+        }
+      }
+      steps {
+        redeployService("prod", prodAWSCredentialsId, awsRegion, ecsClusterPrefix, nginxServiceName)
+      }
+    }
+  }
+}
+
+void redeployService(environment, awsCredentialsId, awsRegion, ecsClusterPrefix, serviceName) {
+  withAwsCli(credentialsId: awsCredentialsId, defaultRegion: awsRegion) {
+    sh script: "aws ecs update-service --region ${awsRegion} --cluster ${ecsClusterPrefix}-${environment}-cluster --service ${serviceName} --force-new-deployment", label: "Redeploy ${serviceName}"
+    sh script: "aws ecs wait services-stable --region ${awsRegion} --cluster ${ecsClusterPrefix}-${environment}-cluster --services ${serviceName}", label: "Wait for ${serviceName} to become stable"
+  }
+}
+
+void terraformPlan(environment, awsCredentialsId, awsRegion, credentialsProfileName, tfStateS3BucketName, tfStateFileKeyPrefix) {
+  withCredentials([file(credentialsId: 'secret_encryption_key.pem', variable: 'private_key')]) {
+    sh 'cp ${private_key} terraform/deploy/secrets/key.pem'
+  }
+  withAwsCli(credentialsId: awsCredentialsId, defaultRegion: awsRegion) {
+    sh script: "./configure_provider.sh ${credentialsProfileName} ${awsRegion} ${tfStateS3BucketName} ${tfStateFileKeyPrefix} terraform.tfstate", label: "Configure AWS provider for terraform"
+    dir('terraform') {
+      sh script: "echo '1' | TF_IN_AUTOMATION=true terraform init -reconfigure", label: "Initialize a working directory containing terraform configuration files, disregard any existing configuration"
+      sh script: "terraform workspace select ${environment} || terraform workspace new ${environment}", label: "Select ${environment} workspace" // THIS IS EXTREMELY IMPORTANT, DON'T TOUCH
+      sh script: "TF_IN_AUTOMATION=true terraform plan -var-file environments/${environment}.terraform.tfvars -out=${environment}-tfplan", label: "Create terraform execution plan"
+    }
+  }
+}
+
+void terraformApply(environment, awsCredentialsId, awsRegion, credentialsProfileName, tfStateS3BucketName, tfStateFileKeyPrefix) {
+  withCredentials([file(credentialsId: 'secret_encryption_key.pem', variable: 'private_key')]) {
+    sh 'cp ${private_key} terraform/deploy/secrets/key.pem'
+  }
+  withAwsCli(credentialsId: awsCredentialsId, defaultRegion: awsRegion) {
+    sh script: "./configure_provider.sh ${credentialsProfileName} ${awsRegion} ${tfStateS3BucketName} ${tfStateFileKeyPrefix} terraform.tfstate", label: "Configure AWS provider for terraform"
+    dir('terraform') {
+      sh script: "echo '1' | TF_IN_AUTOMATION=true terraform init -reconfigure", label: "Initialize a working directory containing terraform configuration files, disregard any existing configuration"
+      sh script: "terraform workspace select ${environment}", label: "Select ${environment} workspace" // THIS IS EXTREMELY IMPORTANT, DON'T TOUCH
+      sh script: "TF_IN_AUTOMATION=true terraform apply ${environment}-tfplan", label: "Apply terraform execution plan"
+      sh script: "rm -rf ${environment}-tfplan", label: "Deleting plan file so it wouldn't stay at rest"
+    }
+  }
+}
+
+void pullTagPushDockerImageECR(sourceImageUrl, targetImageUrl, sourceImageTag, targetImageTag, sourceAwsCredentialsId, targetAwsCredentialsId, sourceAwsRegion, targetAwsRegion) {
+  def sourceImage = "${sourceImageUrl}:${sourceImageTag}"
+  def targetImage = "${targetImageUrl}:${targetImageTag}"
+
+  // If source and target ECR repositories are in different accounts and/or regions we authenticate using different credentials
+  def inSameAccount = (sourceImageUrl == targetImageUrl)
+  sh "echo sourceImageUrl: ${sourceImageUrl}"
+  sh "echo targetImageUrl: ${targetImageUrl}"
+  sh "echo inSameAccount:  ${inSameAccount}"
+
+  if (inSameAccount) {
+    withAwsCli(credentialsId: sourceAwsCredentialsId, defaultRegion: sourceAwsRegion) {
+      sh script: "eval \$(aws ecr get-login --no-include-email --region ${sourceAwsRegion})", label: "Login to shared ECR"
+      sh script: "docker pull ${sourceImage}", label: "Pulling image"
+      sh script: "docker tag ${sourceImage} ${targetImage}", label: "Tagging image"
+      sh script: "docker push ${targetImage}", label: "Push image with new tag to ECR"
+      sh script: "docker rmi ${sourceImage} ${targetImage}", label: "Delete images locally"
+    }
+  } else {
+    withAwsCli(credentialsId: sourceAwsCredentialsId, defaultRegion: sourceAwsRegion) {
+      sh script: "eval \$(aws ecr get-login --no-include-email --region ${sourceAwsRegion})", label: "Login to source ECR"
+      sh script: "docker pull ${sourceImage}", label: "Pulling image"
+    }
+    withAwsCli(credentialsId: targetAwsCredentialsId, defaultRegion: targetAwsRegion) {
+      sh script: "eval \$(aws ecr get-login --no-include-email --region ${targetAwsRegion})", label: "Login to target ECR"
+      sh script: "docker tag ${sourceImage} ${targetImage}", label: "Tagging image"
+      sh script: "docker push ${targetImage}", label: "Push image with new tag to ECR"
+      sh script: "docker rmi ${sourceImage} ${targetImage}", label: "Delete images locally"
+    }
+  }  
+}
+
+void sendNotification(String buildStatus = 'STARTED', String lastStage = '', Boolean approval = false) {
+ // build status of null means successful
+ buildStatus =  buildStatus ?: 'SUCCESS'
+
+ // Default values
+ def color = 'RED'
+ def colorCode = '#FF0000'
+
+ // Override default values based on build status
+ if (approval) {
+   color = 'BLUE'
+   colorCode = '#009FE3'
+   buildStatus = 'WAITING_APPROVAL'
+ } else if (buildStatus == 'STARTED') {
+   color = 'YELLOW'
+   colorCode = '#FFFF00'
+ } else if (buildStatus == 'SUCCESS') {
+   color = 'GREEN'
+   colorCode = '#00FF00'
+ }
+
+ def subject = "${buildStatus}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' | STAGE: ${lastStage}"
+ def summary = "${subject} (${env.BUILD_URL})"
+
+ // Send notifications
+ slackSend (color: colorCode, message: summary)
+}
